@@ -56,6 +56,50 @@ class NonexistentFormatsError(KhinsiderError):
         )
 
 
+# Filesystem limit is 255 bytes per name on ext4/NTFS; stay well below it to
+# leave room for an extension and the ".part" suffix.
+MAX_FILENAME_BYTES = 200
+
+INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*')
+
+# Windows refuses to create files with these names, extension or not.
+WINDOWS_RESERVED_NAMES = frozenset(
+    ['CON', 'PRN', 'AUX', 'NUL']
+    + [f'COM{i}' for i in range(1, 10)]
+    + [f'LPT{i}' for i in range(1, 10)]
+)
+
+
+def _truncate_bytes(text, max_bytes):
+    """Cut ``text`` to at most ``max_bytes`` UTF-8 bytes without splitting a character."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode('utf-8', 'ignore')
+
+
+def _sanitize_filename(filename):
+    """Turn an arbitrary (possibly remote) string into one safe path component."""
+    cleaned = ''.join(c if c not in INVALID_FILENAME_CHARS else '-' for c in filename)
+    cleaned = ''.join(c for c in cleaned if c.isprintable())
+    cleaned = cleaned.strip(' .')
+    if not cleaned:
+        return 'unnamed'
+
+    stem, ext = os.path.splitext(cleaned)
+    # Keep a recognisable extension when trimming an over-long name.
+    ext_bytes = len(ext.encode('utf-8'))
+    if ext_bytes > 16:
+        stem, ext = cleaned, ''
+        ext_bytes = 0
+    stem = _truncate_bytes(stem, MAX_FILENAME_BYTES - ext_bytes).rstrip(' .') or 'unnamed'
+    cleaned = stem + ext
+
+    if cleaned.split('.')[0].strip().upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = '_' + cleaned
+    return cleaned
+
+
 class Soundtrack:
     def __init__(self, soundtrack_id):
         self.id = soundtrack_id
@@ -68,13 +112,21 @@ class Soundtrack:
         try:
             r = SESSION.get(self.url, timeout=REQUEST_TIMEOUT)
             r.raise_for_status()
-            soup = BeautifulSoup(r.content, 'html.parser')
-            content = soup.find(id='pageContent')
-            if content and content.find('p') and content.find('p').text.strip() == 'No such album':
-                raise NonexistentSoundtrackError(f'Soundtrack "{self.id}" does not exist.')
-            return content
         except requests.RequestException as e:
-            raise KhinsiderError(f'Network error: {e}')
+            raise KhinsiderError(f'Network error: {e}') from e
+
+        soup = BeautifulSoup(r.content, 'html.parser')
+        content = soup.find(id='pageContent')
+        if content is None:
+            # Blocked/challenged request, maintenance page or a layout change.
+            # Raising here keeps the failure readable instead of an AttributeError.
+            raise KhinsiderError(
+                f'Unexpected page for soundtrack "{self.id}": no album content found '
+                '(request blocked, site under maintenance, or page layout changed).'
+            )
+        if content.find(string=re.compile('No such album')):
+            raise NonexistentSoundtrackError(f'Soundtrack "{self.id}" does not exist.')
+        return content
 
     @property
     def content_soup(self):
@@ -120,9 +172,10 @@ class Soundtrack:
         return songs
 
     def download(self, path='', format_order=None, verbose=False):
-        path = os.path.abspath(path or self.name)
-        if not os.path.exists(path):
-            os.makedirs(path)
+        # Only the album name derived from the site is sanitized; an explicit,
+        # user-provided path is used as given.
+        path = os.path.abspath(path or _sanitize_filename(self.name))
+        os.makedirs(path, exist_ok=True)
 
         if format_order:
             format_order = [fmt.lower().lstrip('.') for fmt in format_order]
@@ -133,19 +186,26 @@ class Soundtrack:
         songs = self.songs
         total_files = len(songs)
         for idx, song in enumerate(songs, 1):
-            file_to_download = song.get_preferred_file(format_order)
-            if file_to_download is None:
-                msg = f'Skipping song {idx}/{total_files} "{song.name}": no matching format found.'
-                print(msg, file=sys.stderr)
-                success = False
-                continue
-            if verbose:
-                print(f'[{idx}/{total_files}] {file_to_download.filename}')
+            # Everything that can touch the network belongs inside the try: a
+            # broken song page must fail that song, not the whole album.
             try:
+                file_to_download = song.get_preferred_file(format_order)
+                if file_to_download is None:
+                    requested = '/'.join(format_order or []) or 'any'
+                    offered = ', '.join(song.available_formats) or 'none'
+                    print(
+                        f'Skipping song {idx}/{total_files} "{song.name}": '
+                        f'no {requested} file (track offers: {offered}).',
+                        file=sys.stderr,
+                    )
+                    success = False
+                    continue
+                if verbose:
+                    print(f'[{idx}/{total_files}] {file_to_download.filename}')
                 file_to_download.download(path, show_progress=verbose)
             except (requests.RequestException, OSError, KhinsiderError) as e:
                 print(
-                    f'Failed to download {file_to_download.filename}: {e}',
+                    f'Failed to download song {idx}/{total_files} ({song.url}): {e}',
                     file=sys.stderr,
                 )
                 success = False
@@ -196,16 +256,30 @@ class Song:
             self._files = [File(urljoin(self.url, a['href'])) for a in anchors]
         return self._files
 
+    @property
+    def available_formats(self):
+        """Extensions offered by this track's page, in page order."""
+        formats = []
+        for f in self.files:
+            ext = os.path.splitext(f.filename)[1].lower().lstrip('.')
+            if ext and ext not in formats:
+                formats.append(ext)
+        return formats
+
     def get_preferred_file(self, format_order=None):
         if not self.files:
             return None
         if format_order is None:
+            # No preference expressed: take whatever the page lists first.
             return self.files[0]
         for ext in format_order:
             for f in self.files:
                 if f.filename.lower().endswith('.' + ext):
                     return f
-        return self.files[0]
+        # A format preference was given and none of it matched. Returning None
+        # (instead of the first file) fails this track with a clear message
+        # rather than silently downloading a format the user did not ask for.
+        return None
 
 
 class File:
@@ -214,68 +288,90 @@ class File:
         self.filename = unquote(url.rsplit('/', 1)[-1])
 
     def download(self, directory, show_progress=False):
-        final_path = os.path.join(directory, self._sanitize_filename(self.filename))
+        final_path = os.path.join(directory, _sanitize_filename(self.filename))
         if os.path.exists(final_path):
             return
         tmp_path = final_path + '.part'
 
-        # Best-effort cleanup of stale .part from a previous interrupted run.
+        # An interrupted earlier run leaves a .part behind; continue from there.
+        resume_from = 0
         if os.path.exists(tmp_path):
             try:
-                os.remove(tmp_path)
+                resume_from = os.path.getsize(tmp_path)
             except OSError:
-                pass
+                resume_from = 0
 
-        try:
-            with SESSION.get(self.url, stream=True, timeout=REQUEST_TIMEOUT) as r:
-                r.raise_for_status()
-                content_type = r.headers.get('Content-Type', '')
-                if not any(ct in content_type for ct in ('audio', 'application/octet-stream')):
-                    raise KhinsiderError(f'URL did not return an audio file: {self.url}')
+        headers = {'Range': f'bytes={resume_from}-'} if resume_from else None
 
-                total = int(r.headers.get('Content-Length', 0)) or None
-                progress = None
-                if show_progress:
-                    progress = tqdm(
-                        total=total,
-                        unit='B',
-                        unit_scale=True,
-                        unit_divisor=1024,
-                        desc=self.filename[:40],
-                        leave=False,
-                    )
+        with SESSION.get(self.url, stream=True, timeout=REQUEST_TIMEOUT, headers=headers) as r:
+            if resume_from and r.status_code == 416:
+                # Nothing left to fetch: the partial file is already complete.
+                os.replace(tmp_path, final_path)
+                return
+            r.raise_for_status()
 
-                bytes_written = 0
-                with open(tmp_path, 'wb') as f:
+            if resume_from and r.status_code != 206:
+                # Server ignored the Range request, so the body is the whole file.
+                resume_from = 0
+
+            content_type = r.headers.get('Content-Type', '')
+            if not any(ct in content_type for ct in ('audio', 'application/octet-stream')):
+                raise KhinsiderError(f'URL did not return an audio file: {self.url}')
+
+            total = self._total_size(r, resume_from)
+            progress = None
+            if show_progress:
+                progress = tqdm(
+                    total=total,
+                    initial=resume_from,
+                    unit='B',
+                    unit_scale=True,
+                    unit_divisor=1024,
+                    desc=self.filename[:40],
+                    leave=False,
+                )
+
+            bytes_written = resume_from
+            try:
+                with open(tmp_path, 'ab' if resume_from else 'wb') as f:
                     for chunk in r.iter_content(chunk_size=64 * 1024):
                         if chunk:
                             f.write(chunk)
                             bytes_written += len(chunk)
                             if progress is not None:
                                 progress.update(len(chunk))
+            finally:
                 if progress is not None:
                     progress.close()
 
-                if total is not None and bytes_written != total:
-                    raise KhinsiderError(
-                        f'Incomplete download: expected {total} bytes, got {bytes_written}'
-                    )
+            if total is not None and bytes_written != total:
+                # Keep the partial file: the next run resumes from here.
+                raise KhinsiderError(
+                    f'Incomplete download: expected {total} bytes, got {bytes_written}'
+                )
 
-            # Atomic rename only on full success.
-            os.replace(tmp_path, final_path)
-        except BaseException:
-            # On any failure (network, disk, KeyboardInterrupt) remove the partial file.
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-            raise
+        # Atomic rename only on full success.
+        os.replace(tmp_path, final_path)
+
+    @staticmethod
+    def _total_size(response, already_have):
+        """Full size of the remote file, or None when the server hides it."""
+        content_range = response.headers.get('Content-Range')
+        if content_range:
+            match = re.match(r'bytes\s+\d+-\d+/(\d+)', content_range.strip())
+            if match:
+                return int(match.group(1))
+        length = response.headers.get('Content-Length')
+        if length:
+            try:
+                return already_have + int(length)
+            except ValueError:
+                return None
+        return None
 
     @staticmethod
     def _sanitize_filename(filename):
-        invalid_chars = r'<>:"/\\|?*'
-        return ''.join(c if c not in invalid_chars else '-' for c in filename).rstrip(' .')
+        return _sanitize_filename(filename)
 
 
 def search(term):

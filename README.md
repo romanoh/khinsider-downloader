@@ -10,8 +10,10 @@ audio format (e.g. FLAC over MP3 when available).
 
 - Download a full album by its khinsider album ID (slug from the URL)
 - Search albums by name from the command line
-- Pick preferred format(s) per album (e.g. `flac,mp3,ogg`)
-- Resumable-safe downloads (atomic `.part` rename on success)
+- Pick preferred format(s) per album (e.g. `flac,mp3,ogg`); a track without
+  any of them is reported, never silently downloaded in another format
+- Resumable downloads: an interrupted transfer continues from where it stopped
+  (HTTP `Range`), with an atomic `.part` → final rename only on success
 - Automatic retry with exponential backoff on transient network errors
 - Progress bar per file (via `tqdm`)
 - Shared HTTP connection (keep-alive) for faster multi-track downloads
@@ -61,8 +63,16 @@ python khinsider.py chrono-trigger-original-sound-version "D:\Music\OSTs\Chrono 
 python khinsider.py chrono-trigger-original-sound-version -f flac,mp3
 ```
 
-If no track is available in any of the requested formats, the download fails
-with a clear error listing the formats actually available for that album.
+Formats are tried in the order given, and the download never silently falls back
+to a format you did not ask for.
+
+- If the album offers none of the requested formats, nothing is downloaded and
+the command exits with an error listing the formats the album does offer.
+- If only some tracks lack the requested formats, those tracks are skipped with
+a message naming what each one offers, the remaining tracks are downloaded, and
+the command exits with code 1.
+
+Without `-f`, the first file listed on each track page is downloaded.
 
 ### Search instead of downloading
 
